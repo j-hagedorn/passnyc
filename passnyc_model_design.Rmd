@@ -1,0 +1,332 @@
+---
+title: "passnyc"
+output: html_notebook
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  echo = T, warning = F, message = F,
+  fig.width = 6,fig.asp = 0.618,out.width = "80%",fig.align = "center"
+)
+```
+
+```{r load_libs}
+library(tidyverse);library(plotly);library(leaflet);library(htmltools);library(magrittr)
+```
+
+```{r get_data}
+schools <- 
+  read_csv(
+    file = "data/2016 School Explorer.csv",
+    na = c("", "NA","N/A")
+  )
+
+tests <- read_csv(file = "data/D5 SHSAT Registrations and Testers.csv")
+
+# Clean names
+names(schools) <- str_replace_all(names(schools), "(|)|\\?|\\-", "")
+names(schools) <- tolower(str_replace_all(names(schools), " ", "_"))
+names(tests) <- tolower(str_replace_all(names(tests), " ", "_"))
+```
+
+```{r get_api_data}
+
+library("RSocrata")
+
+nyc_attend_12_17 <- read.socrata(
+  url = "https://data.cityofnewyork.us/resource/s9bd-hden.json",
+  app_token = Sys.getenv("socrata_token"),
+  email     = Sys.getenv("socrata_email"),
+  password  = Sys.getenv("socrata_pw")
+)
+
+nyc_attend_ytd <- read.socrata(
+  url = "https://data.cityofnewyork.us/resource/5vg6-6vfs.json",
+  app_token = Sys.getenv("socrata_token"),
+  email     = Sys.getenv("socrata_email"),
+  password  = Sys.getenv("socrata_pw")
+)
+
+nyc_sat_2012 <- read.socrata(
+  url = "https://data.cityofnewyork.us/resource/734v-jeq5.json",
+  app_token = Sys.getenv("socrata_token"),
+  email     = Sys.getenv("socrata_email"),
+  password  = Sys.getenv("socrata_pw")
+)
+
+nyc_graduate <- read.socrata(
+  url = "https://data.cityofnewyork.us/resource/ns8x-c6af.json",
+  app_token = Sys.getenv("socrata_token"),
+  email     = Sys.getenv("socrata_email"),
+  password  = Sys.getenv("socrata_pw")
+)
+
+```
+
+```{r combine_data}
+
+nyc_attend_ytd %<>% 
+  mutate(schoolyear = "2017 - 2018") %>%
+  select(absent,calmonth,gradelevel,gradesort,monthcode,present,released,rostercount,school,schoolyear)
+
+nyc_attend <-
+  nyc_attend_12_17 %>%
+  bind_rows(nyc_attend_ytd) %>%
+  mutate_at(
+    .vars = vars(absent,gradesort,present,released,rostercount),
+    .funs = funs(as.numeric)
+  ) %>%
+  mutate(tot = present + absent) %>%
+  select(school,schoolyear,calmonth,monthcode,gradelevel,gradesort,present,absent,released,rostercount,tot) %>%
+  group_by(school,schoolyear,gradelevel) %>% 
+  summarize(
+    absent = sum(absent),
+    present = sum(present),
+    tot = sum(tot),
+    n_months = n_distinct(calmonth)
+  ) %>%
+  mutate(
+    gradelevel = recode(
+      gradelevel,
+      `6` = "06",
+      `7` = "07",
+      `8` = "08",
+      `9` = "09"
+    )
+  ) %>%
+  filter(
+    gradelevel %in% c("06","07","08")
+    & schoolyear %in% c("2015 - 2016","2016 - 2017","2017 - 2018")
+  ) %>%
+  group_by(school) %>%
+  summarize(
+    absent = sum(absent),
+    present = sum(present),
+    tot = sum(tot),
+    n_months = sum(n_months)
+  ) %>%
+  mutate(
+    avg_absent = round(absent / n_months, digits = 1),
+    avg_present = round(present / n_months, digits = 1),
+    avg_tot = round(tot / n_months, digits = 1),
+    attend_rate = round(present / tot * 100, digits = 1)
+  ) %>%
+  select(location_code = school, avg_tot, attend_rate)
+
+rm(nyc_attend_12_17); rm(nyc_attend_ytd)
+
+```
+
+
+```{r clean_data}
+schools <-
+  schools %>%
+  mutate(
+    school_income_estimate = as.numeric(
+      str_replace_all(school_income_estimate,"\\$|,","")
+    ),
+    sed_code = as.character(sed_code),
+    economic_need_index = as.numeric(economic_need_index)
+  ) %>%
+  mutate_at(
+    .vars = vars(matches("percent|%|rate")),
+    .funs = funs(str_replace_all),
+    pattern = "%", replacement = ""
+  ) %>%
+  mutate_at(
+    .vars = vars(matches("percent|%|rate")),
+    .funs = funs(as.numeric)
+  ) %>%
+  mutate(
+    percent_nonwhite = 100 - percent_white
+  )
+  
+  
+```
+
+The [Princeton Review](https://www.princetonreview.com/k12/shsat-information) notes that they "do not recommend waiting until 9th grade to take the test as these high schools have a very limited number of 10th grade seats available."
+
+```{r subset_join}
+subset_schools <-
+  schools %>%
+  filter(as.numeric(grade_high) %in% 6:8) %>%
+  select(
+    location_code, school_name, latitude, longitude, zip, grade_high, `community_school?`, economic_need_index, 
+    student_attendance_rate, percent_of_students_chronically_absent,school_income_estimate, `rigorous_instruction_%`:student_achievement_rating, percent_ell, percent_nonwhite,
+    starts_with("grade_6"),starts_with("grade_7"),starts_with("grade_8")
+  ) 
+
+tst <- 
+  subset_schools %>% 
+  left_join(nyc_attend, by = "location_code")
+
+```
+
+
+# What is the problem?
+
+Per [NY Times article](https://www.nytimes.com/2018/06/21/nyregion/what-is-the-shsat-exam-and-why-does-it-matter.html), "Beginning in the fall of 2019, the city would set aside 20 percent of seats for low-income students who score just below the lowest cutoff score."
+
+# Who are we trying to help?
+
+We want to identify schools with kids who are: 
+
+- from backgrounds that would diversify the specialty schools (e.g. immigrants, kids with disabilities, poor students, hardships)
+- eligible to take the SHSAT (*meaning that the school should meet the above criteria for the upper grades prior to high school, since these are the grades where kids take the SHSAT*)
+- in schools that do not have significant resources but are performing relatively well anyway
+- in schools that have a positive culture
+- "stand to gain the most" from services like after school programs, test preparation, mentoring, or resources for parents
+- low income, according to the 2019 admission policy
+
+## Identifying relevant variables
+
+### Related to student demographic characteristics:
+
+- Immigrants: `percent_ell`, `ends_with("_limited_english_proficient")`
+- Economically disadvantaged: `economic_need_index`, `ends_with("_economically_disadvantaged")`. We also use the ``, which "reflects the socioeconomics of the school population."^[According to [the NYC Educator Guide](http://schools.nyc.gov/NR/rdonlyres/7B6EEB8B-D0E8-432B-9BF6-3E374958EA70/0/EducatorGuide_EMS_20131118.pdf)  It is calculated using the following formula: Economic Need Index = (Percent Temporary Housing) + (Percent 
+HRA-eligible * 0.5) + (Percent Free Lunch Eligible * 0.5)]
+- Disabilities: no variables were found in the schools data set, though we may be able to find other publically available data. 
+- Absentees: `student_attendance_rate`, `percent_of_students_chronically_absent`
+- Race/Ethnicity: While the PASSNYC problem statement indicated that more 'homogenous student body demographics' were a part of what it sought to address in developing specialized school enrollment for "a more diverse group of students", they did not explicitly identify which groups were over/under-represented.  We will keep these variables in to evaluate our model, but not use these variables to ilter schools out of the results.  Variables which identify race/ethnicity include: `percent_nonwhite`, `ends_with("_american_indian_or_alaska_native")`, `ends_with("_black_or_african_american")`, `ends_with("_hispanic_or_latino")`, `ends_with("_asian_or_pacific_islander")`, `ends_with("_white")`, `ends_with("_multiracial")`
+
+
+
+We might want to look at schools which have a high percent of English language learners (ELL), which we can summarize by looking at the histogram below:
+
+```{r}
+subset_schools %>% plot_ly(x = ~percent_ell) %>% add_histogram()
+```
+
+However, the likelihood is that some schools with a high percent of ELL won't necessarily have a high percentage of African-American or Latino students.  So, we want to start by looking at all of the relevant variables in one view, called a heatmap:
+
+
+```{r}
+subset_schools %>% 
+  set_rownames(.$sed_code) %>%
+  select(economic_need_index:percent_nonwhite) %>%
+  select(-ends_with("_rating")) %>%
+  scale() %>%
+  d3heatmap::d3heatmap(
+    colors = viridisLite::viridis(30, direction = -1),
+    k_row = 5,
+    na.rm = T,
+    show_grid = F
+  )
+
+```
+
+
+
+# How are we trying to help them?
+
+- Motivating them to study for the SHSAT
+- Tutoring and test preparation for the SHSAT
+- Application to specialty high schools
+
+# Where is the best place to go to help them?
+
+- Where there are the greatest number of kids fitting this criteria
+- With students in the most advanced grades who are candidates for specialty schools (*How long does it take to establish relationships with schools?  If awhile, may want to pick schools that meet criteria for multiple upper grades in a row*)
+- Can kids come from other schools if they're nearby?
+
+
+
+```{r}
+colnames(schools) %>% as.data.frame() %>% View()
+```
+
+## Find Relevant Variables
+
+
+
+
+Find schools that have:
+
+- high `percent_ell` 
+- high `economic_need_index`
+- high `student_attendance_rate` and low `percent_of_students_chronically_absent`
+- up to 8th grade
+
+
+```{r}
+tst <-
+subset_schools %>% 
+  filter(
+    grade_high == "08" 
+    & economic_need_index >= 0.675
+    | percent_ell >= 12.5
+  ) %>%
+  filter(
+    percent_of_students_chronically_absent <= 20 
+    & student_attendance_rate >= 80
+  )
+
+```
+
+
+```{r}
+
+subset_schools %>%
+  plot_ly(
+    x = ~percent_of_students_chronically_absent
+  ) %>%
+  add_histogram()
+
+```
+
+
+[community schools](https://www1.nyc.gov/site/communityschools/index.page)
+
+
+```{r}
+schools %>% 
+  plot_ly(
+    x=~fct_reorder(school_name,percent_ell,.desc = T),
+    y=~percent_ell
+  )
+
+```
+
+```{r}
+schools %>% 
+  plot_ly(
+    x=~percent_ell,
+    y=~economic_need_index
+  ) %>%
+  add_markers()
+```
+
+What is the criteria for specialty schools?
+Are specialty schools merit based or lottery based schools?
+
+# Maps/Location
+
+```{r map}
+
+schools %>% 
+  leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    ~longitude, 
+    ~latitude,
+    popup = ~paste0(
+      "<b>School Name:</b> ",htmlEscape(school_name),"<br/>",
+      "<b>Address:</b> ",htmlEscape(`address_full`)
+    ),
+    stroke = FALSE,
+    radius = 5,
+    fillOpacity = 0.6
+  )
+
+```
+
+# Appendix 1: Open NYC Datasets
+
+The following datasets were considered as candidates for inclusion in the analysis:
+
+- [Universal Pre-K School Locations](https://www.kaggle.com/new-york-city/nyc-universal-pre-k-upk-school-locations)
+- [School District Breakdowns](https://www.kaggle.com/new-york-city/nyc-school-district-breakdowns)
+- [SAT Results](https://www.kaggle.com/new-york-city/new-york-city-sat-results)
+- [Graduation Outcomes](https://www.kaggle.com/new-york-city/new-york-city-graduation-outcomes)
+- [School Attendance and Enrollment](https://www.kaggle.com/new-york-city/ny-school-attendance-and-enrollment)
+- [NYPL Branch Services](https://www.kaggle.com/new-york-city/nyc-nypl-branch-services)
