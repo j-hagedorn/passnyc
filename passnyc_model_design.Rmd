@@ -21,12 +21,12 @@ schools <-
     na = c("", "NA","N/A")
   )
 
-tests <- read_csv(file = "data/D5 SHSAT Registrations and Testers.csv")
+shsat <- read_csv(file = "data/D5 SHSAT Registrations and Testers.csv")
 
 # Clean names
 names(schools) <- str_replace_all(names(schools), "(|)|\\?|\\-", "")
 names(schools) <- tolower(str_replace_all(names(schools), " ", "_"))
-names(tests) <- tolower(str_replace_all(names(tests), " ", "_"))
+names(shsat) <- tolower(str_replace_all(names(tests), " |/", "_"))
 ```
 
 ```{r get_api_data}
@@ -42,6 +42,13 @@ nyc_attend_12_17 <- read.socrata(
 
 nyc_attend_ytd <- read.socrata(
   url = "https://data.cityofnewyork.us/resource/5vg6-6vfs.json",
+  app_token = Sys.getenv("socrata_token"),
+  email     = Sys.getenv("socrata_email"),
+  password  = Sys.getenv("socrata_pw")
+)
+
+nyc_school_crime <- read.socrata(
+  url = "https://data.cityofnewyork.us/resource/sm8b-9vim.json",
   app_token = Sys.getenv("socrata_token"),
   email     = Sys.getenv("socrata_email"),
   password  = Sys.getenv("socrata_pw")
@@ -63,7 +70,7 @@ nyc_graduate <- read.socrata(
 
 ```
 
-```{r combine_data}
+```{r clean_attend}
 
 nyc_attend_ytd %<>% 
   mutate(schoolyear = "2017 - 2018") %>%
@@ -117,6 +124,42 @@ rm(nyc_attend_12_17); rm(nyc_attend_ytd)
 
 ```
 
+Next, we'll subset the SHSAT data provided in order to gain a single observation per school (i.e. `dbn`).
+
+```{r clean_shsat}
+
+shsat %<>%
+  filter(grade_level <= 8) %>%
+  group_by(dbn) %>%
+  filter(
+    year_of_shst == max(year_of_shst)
+  ) %>%
+  select(-school_name)
+
+```
+
+```{r clean_crime}
+nyc_school_crime <-
+  nyc_school_crime %>%
+  mutate_at(
+    .vars = vars(ends_with("_n")),
+    .funs = funs(as.numeric)
+  ) %>%
+  select(dbn,school_year,ends_with("_n")) %>%
+  select(-starts_with("avg")) %>%
+  filter(is.na(major_n) == F) %>%
+  group_by(dbn) %>%
+  filter(school_year == max(school_year)) %>%
+  rename(
+    crime_yr = school_year,
+    major_crimes = major_n,
+    noncrim_crimes = nocrim_n,
+    other_crimes = oth_n,
+    property_crimes = prop_n,
+    violent_crimes = vio_n
+  )
+```
+
 
 ```{r clean_data}
 schools <-
@@ -144,7 +187,7 @@ schools <-
   
 ```
 
-The [Princeton Review](https://www.princetonreview.com/k12/shsat-information) notes that they "do not recommend waiting until 9th grade to take the test as these high schools have a very limited number of 10th grade seats available."
+The [Princeton Review](https://www.princetonreview.com/k12/shsat-information) notes that they "do not recommend waiting until 9th grade to take the test as these high schools have a very limited number of 10th grade seats available."  PASSNYC "partner[s] with NYC middle schools" to accomplish their objectives, and we thus filter the data to focus on these grade levels.
 
 ```{r subset_join}
 subset_schools <-
@@ -156,12 +199,14 @@ subset_schools <-
     starts_with("grade_6"),starts_with("grade_7"),starts_with("grade_8")
   ) 
 
-tst <- 
+schools_joined <- 
   subset_schools %>% 
-  left_join(nyc_attend, by = "location_code")
+  left_join(shsat, by = c("location_code" = "dbn")) %>%
+  left_join(nyc_attend, by = "location_code") %>%
+  left_join(nyc_school_crime, by = c("location_code" = "dbn")) %>%
+  distinct(location_code, .keep_all = T)
 
 ```
-
 
 # What is the problem?
 
@@ -194,27 +239,137 @@ HRA-eligible * 0.5) + (Percent Free Lunch Eligible * 0.5)]
 We might want to look at schools which have a high percent of English language learners (ELL), which we can summarize by looking at the histogram below:
 
 ```{r}
-subset_schools %>% plot_ly(x = ~percent_ell) %>% add_histogram()
+schools_joined %>% plot_ly(x = ~percent_ell) %>% add_histogram()
 ```
 
 However, the likelihood is that some schools with a high percent of ELL won't necessarily have a high percentage of African-American or Latino students.  So, we want to start by looking at all of the relevant variables in one view, called a heatmap:
 
-
 ```{r}
-subset_schools %>% 
-  set_rownames(.$sed_code) %>%
+schools_joined %>% 
+  set_rownames(.$location_code) %>%
   select(economic_need_index:percent_nonwhite) %>%
-  select(-ends_with("_rating")) %>%
+  select(-ends_with("_rating"),-school_income_estimate) %>%
   scale() %>%
+  # complete.cases() %>%
+  # mutate_at(
+  #   .vars = vars(percent_of_students_chronically_absent,rigorous_instruction_%),
+  #   .funs = funs(. * -1)
+  # )
   d3heatmap::d3heatmap(
-    colors = viridisLite::viridis(30, direction = -1),
-    k_row = 5,
+    colors = viridisLite::viridis(100, direction = -1),
+    k_row = 8,
     na.rm = T,
     show_grid = F
   )
 
 ```
 
+Based on exploration of these clusters, we realize that students in our target populations (i.e. those with a high number/percent of African American/Hispanic students) fall across various clustered groups when we consider all relevant variables.  Some are in schools with rigorous instruction, some in schools with weak community ties, etc.  So we we want to focus the issue by filtering out schools that do not meet critical values on the critical variables of: `percent_nonwhite`, `percent_ell`, and `economic_need_index`.  One we limit our view to schools that meet these criteria, we can use the other variables to identify the environments where PASSNYC's work could best be integrated into the environment.
+
+```{r}
+tst <-
+  schools_joined %>%
+  #group_by(location_code) %>%
+  select(starts_with("grade_")) %>%
+  select(contains("ela")) %>%
+  select(-ends_with("_white"))
+```
+
+
+```{r}
+schools_matrix <-
+  schools_joined %>% 
+  set_rownames(.$location_code) %>%
+  select(economic_need_index:percent_nonwhite,starts_with("grade_")) %>%
+  select(-ends_with("_rating"),-school_income_estimate,-grade_high,-grade_level) %>%
+  filter(
+    ntile(percent_nonwhite, 4) > 1
+    & ntile(percent_ell, 4) > 1
+    & ntile(economic_need_index, 4) > 1
+  ) %>%
+  # filter(complete.cases(.)) %>%
+  scale() %>%
+  # And remove columns with all NaN values
+  .[,colSums(!is.nan(.))>0] %>%
+  as.tibble() %>%
+  mutate(
+    not_chronic_absent = percent_of_students_chronically_absent * -1,
+    need_instruction = `rigorous_instruction_%` * -1
+  ) %>%
+  select(-percent_of_students_chronically_absent,-`rigorous_instruction_%`) 
+
+schools_matrix %>%
+  # select(-starts_with("grade")) %>%
+  d3heatmap::d3heatmap(
+    colors = viridisLite::viridis(30, direction = -1),
+    k_row = 8,
+    na.rm = T,
+    show_grid = F
+  )
+
+```
+
+
+```{r}
+
+library(broom); library(irlba)
+# sparse_matrix <- subset_schools %>% tidytext::cast_sparse(User, Tag, Value)
+
+schools_pca <- 
+  schools_matrix %>%
+  # Convert to matrix
+  as.matrix() %>% 
+  irlba::prcomp_irlba(n = ncol(schools_matrix) - 1)
+
+tidied_pca <- 
+  bind_cols(
+    variable = colnames(schools_matrix),
+    tidy(schools_pca$rotation)
+  ) %>%
+  gather(pc, contribution, -variable)
+
+```
+
+
+```{r}
+  
+  tidied_pca %>% 
+    filter(pc %in% paste0("PC", 1:6)) %>%
+    ggplot(aes(variable, contribution, fill = variable)) +
+    geom_col(show.legend = FALSE, alpha = 0.8) +
+    theme(
+      axis.text.x = element_blank(), 
+      axis.ticks.x = element_blank(),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank()
+    ) + 
+    labs(x = "Variable",
+         y = "Relative importance in each principal component") +
+    facet_wrap(~ pc, ncol = 2)
+```
+
+```{r}
+
+percent_variation <- schools_pca$sdev^2 / sum(schools_pca$sdev^2)
+
+augmented_pca <- 
+  bind_cols(
+    row_n = rownames(schools_matrix),
+    tidy(schools_pca$x)
+  )
+
+augmented_pca %>%
+    mutate(row_n = as.integer(row_n)) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(size = 1.3, color = "midnightblue", alpha = 0.1) +
+    labs(
+      x = paste0("Principal component 1 (",  round(percent_variation[1] * 100, digits = 1), "%)"), 
+      y = paste0("Principal component 2 (",  round(percent_variation[2] * 100, digits = 1),"%)"),
+      title = "Projection of Schools on to the first two principal components",
+      subtitle = "The high dimensional space can be projected onto components we have explored"
+    )
+
+```
 
 
 # How are we trying to help them?
