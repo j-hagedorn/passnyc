@@ -3,7 +3,7 @@
 .RData
 .Ruserdata
 *.Renviron
-
+.ipynb_checkpoints
 # Data files
 *.csv
 
